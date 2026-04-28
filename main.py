@@ -400,34 +400,87 @@ def classify_capcut_plan(sub_data):
     """
     Classify CapCut subscription into: PRO, STANDARD, TEAM, FREE
     Based on subscription info from commerce API.
+    Handles multiple API response formats.
     """
     if not sub_data:
+        logging.warning("[PLAN] sub_data is empty/None")
         return "FREE", {}
 
-    subs = sub_data.get("data", {}).get("subscription_info", [])
+    # Log raw response for debugging
+    logging.info(f"[PLAN] Raw sub_data keys: {list(sub_data.keys()) if isinstance(sub_data, dict) else type(sub_data)}")
+
+    data_field = sub_data.get("data", {})
+
+    # Try multiple paths to find subscription entries
+    subs = []
+
+    if isinstance(data_field, dict):
+        # Path 1: data.subscription_info (array)
+        if "subscription_info" in data_field:
+            subs = data_field["subscription_info"]
+            if isinstance(subs, dict):
+                subs = [subs]
+        # Path 2: data.subscribe_info
+        elif "subscribe_info" in data_field:
+            subs = data_field["subscribe_info"]
+            if isinstance(subs, dict):
+                subs = [subs]
+        # Path 3: data.vip_info
+        elif "vip_info" in data_field:
+            vi = data_field["vip_info"]
+            subs = [vi] if isinstance(vi, dict) else (vi if isinstance(vi, list) else [])
+        # Path 4: data itself has vip fields
+        elif any(k in data_field for k in ("is_vip", "vip_type", "vip_end_time", "expire_time", "subscription_id")):
+            subs = [data_field]
+    elif isinstance(data_field, list):
+        subs = data_field
+
+    # Also check top-level for vip fields (some endpoints)
+    if not subs and isinstance(sub_data, dict):
+        if any(k in sub_data for k in ("is_vip", "vip_type", "vip_end_time")):
+            subs = [sub_data]
+
     if not subs:
-        # Try alternate response format
-        if isinstance(sub_data.get("data"), list):
-            subs = sub_data["data"]
-        else:
-            return "FREE", {}
+        logging.warning(f"[PLAN] No subscription entries found. data_field type={type(data_field)}, "
+                        f"keys={list(data_field.keys()) if isinstance(data_field, dict) else 'N/A'}")
+        return "FREE", {}
+
+    logging.info(f"[PLAN] Found {len(subs)} subscription entries")
 
     best_plan = "FREE"
     best_info = {}
 
-    for sub in subs:
-        is_vip = sub.get("is_vip", False)
-        if not is_vip:
+    for idx, sub in enumerate(subs):
+        if not isinstance(sub, dict):
+            continue
+
+        # Check if this entry represents an active subscription
+        # Don't strictly require is_vip — check multiple indicators
+        is_vip = sub.get("is_vip", None)
+        vip_end = sub.get("vip_end_time", 0) or sub.get("expire_time", 0) or sub.get("end_time", 0)
+        subscription_id = sub.get("subscription_id") or sub.get("sub_id") or sub.get("order_id")
+        status = str(sub.get("status", "")).lower()
+        vip_status = sub.get("vip_status", None)
+
+        logging.info(f"[PLAN] Entry {idx}: is_vip={is_vip}, vip_end={vip_end}, "
+                     f"sub_id={subscription_id}, status={status}, vip_status={vip_status}, "
+                     f"keys={list(sub.keys())[:15]}")
+
+        # Skip only if explicitly is_vip=False AND no other active indicators
+        if is_vip is False and not vip_end and not subscription_id:
+            continue
+
+        # Skip cancelled/expired if status says so
+        if status in ("cancelled", "expired", "inactive", "refunded"):
             continue
 
         vip_type = str(sub.get("vip_type", "")).lower()
-        product_name = str(sub.get("product_name", "")).lower()
+        product_name = str(sub.get("product_name", "") or sub.get("plan_name", "") or "").lower()
         scene = str(sub.get("scene", "")).lower()
-        level = str(sub.get("vip_level", "")).lower()
+        level = str(sub.get("vip_level", "") or sub.get("level", "") or "").lower()
 
-        vip_end = sub.get("vip_end_time", 0)
-        auto_renew = sub.get("is_auto_renew", False)
-        pay_way = sub.get("pay_way", "?")
+        auto_renew = sub.get("is_auto_renew", False) or sub.get("auto_renew", False)
+        pay_way = sub.get("pay_way") or sub.get("payment_method") or "?"
 
         # Convert vip_end_time
         expiry_str = "?"
@@ -443,34 +496,43 @@ def classify_capcut_plan(sub_data):
             except Exception:
                 pass
 
+        # Skip if already expired
+        if vip_end and days_left < -1:
+            logging.info(f"[PLAN] Entry {idx}: expired ({days_left} days ago), skipping")
+            continue
+
         info = {
             "expiry": expiry_str,
             "days_left": days_left,
             "auto_renew": auto_renew,
             "pay_way": pay_way,
-            "product_name": sub.get("product_name", "?"),
+            "product_name": sub.get("product_name") or sub.get("plan_name") or "?",
             "vip_type": sub.get("vip_type", "?"),
             "scene": sub.get("scene", "?"),
         }
 
-        # Classify
-        if any(k in product_name for k in ["team", "business", "enterprise"]) or \
+        # Classify — broader matching
+        team_keywords = ["team", "business", "enterprise", "workspace", "org"]
+        pro_keywords = ["pro", "premium", "plus", "unlimited"]
+
+        if any(k in product_name for k in team_keywords) or \
            any(k in scene for k in ["workspace", "team"]) or \
-           any(k in vip_type for k in ["team", "business"]):
+           any(k in vip_type for k in team_keywords):
             if best_plan != "PRO":
                 best_plan = "TEAM"
                 best_info = info
-        elif any(k in product_name for k in ["pro"]) or \
-             any(k in level for k in ["pro"]) or \
-             any(k in vip_type for k in ["pro"]):
+        elif any(k in product_name for k in pro_keywords) or \
+             any(k in level for k in pro_keywords) or \
+             any(k in vip_type for k in pro_keywords):
             best_plan = "PRO"
             best_info = info
         else:
-            # Default VIP = Standard
+            # Any active VIP = at least Standard
             if best_plan == "FREE":
                 best_plan = "STANDARD"
                 best_info = info
 
+    logging.info(f"[PLAN] Final classification: {best_plan}")
     return best_plan, best_info
 
 
@@ -635,51 +697,87 @@ def check_single_account(email, password):
                 app_id = data_field.get("user_id", 0)
 
             # Step 2: Check subscription
-            sub_url = "https://commerce.us.capcut.com/commerce/v3/trade/subscription_infos"
+            # Forward login cookies to subscription domain
+            login_cookies = session.cookies.get_dict()
+            logging.info(f"[SUB] Login cookies domains: {[c.domain for c in session.cookies]}")
+            logging.info(f"[SUB] Login cookie names: {list(login_cookies.keys())[:10]}")
+
+            # Extract session tokens from login response
+            session_key = data_field.get("session_key", "")
+            x_token = data_field.get("x-token", "") or data_field.get("token", "")
+
+            # Try multiple subscription API endpoints
+            sub_urls = [
+                "https://www.capcut.com/commerce/v3/trade/subscription_infos",
+                "https://commerce.us.capcut.com/commerce/v3/trade/subscription_infos",
+                "https://commerce-api-sg.capcut.com/commerce/v3/trade/subscription_infos",
+            ]
+
             sub_payload = json.dumps({
                 "scene": ["vip", "workspace"],
                 "vip_levels": ["vip"],
                 "app_id": app_id
             })
 
-            sub_headers = {
-                "Host": "commerce-api-sg.capcut.com",
-                "Connection": "keep-alive",
-                "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
-                "sign-ver": "1",
-                "sign": "2832a2ea2f27fad70d2d050280945b91",
-                "sec-ch-ua-platform": '"Linux"',
-                "pf": "7",
-                "tdid": "",
-                "sec-ch-ua-mobile": "?0",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-                "loc": "CA",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
-                "appvr": "12.4.0",
-                "app-sdk-version": "48.0.0",
-                "appid": str(app_id),
-                "lan": "en",
-                "device-time": str(int(time.time())),
-                "Origin": "https://www.capcut.com",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": "https://www.capcut.com/",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-            }
+            sub_data = {}
+            for sub_url in sub_urls:
+                sub_host = sub_url.split("//")[1].split("/")[0]
+                sub_headers = {
+                    "Host": sub_host,
+                    "Connection": "keep-alive",
+                    "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+                    "sign-ver": "1",
+                    "sec-ch-ua-platform": '"Linux"',
+                    "pf": "7",
+                    "sec-ch-ua-mobile": "?0",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                    "loc": "CA",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "appvr": "12.4.0",
+                    "app-sdk-version": "48.0.0",
+                    "appid": str(app_id),
+                    "lan": "en",
+                    "device-time": str(int(time.time())),
+                    "Origin": "https://www.capcut.com",
+                    "Sec-Fetch-Site": "same-site",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Dest": "empty",
+                    "Referer": "https://www.capcut.com/",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+                }
+                # Add session token if available
+                if session_key:
+                    sub_headers["x-session-key"] = session_key
+                if x_token:
+                    sub_headers["Authorization"] = f"Bearer {x_token}"
 
-            resp2 = session.post(sub_url, data=sub_payload, headers=sub_headers, timeout=REQUEST_TIMEOUT)
+                try:
+                    resp2 = session.post(sub_url, data=sub_payload, headers=sub_headers, timeout=REQUEST_TIMEOUT)
+                    logging.info(f"[SUB] {sub_host} → status={resp2.status_code}")
 
-            if resp2.status_code == 429:
-                time.sleep(RETRY_DELAY * (attempt + 1))
-                continue
+                    if resp2.status_code == 429:
+                        time.sleep(RETRY_DELAY * (attempt + 1))
+                        continue
 
-            try:
-                sub_data = resp2.json()
-            except Exception:
-                sub_data = {}
+                    try:
+                        sub_data = resp2.json()
+                        logging.info(f"[SUB] Response snippet: {str(sub_data)[:300]}")
+                    except Exception:
+                        logging.warning(f"[SUB] Non-JSON response from {sub_host}: {resp2.text[:200]}")
+                        continue
+
+                    # Check if we got useful data
+                    if sub_data.get("data") or sub_data.get("subscription_info"):
+                        logging.info(f"[SUB] Got data from {sub_host}")
+                        break
+                    elif sub_data.get("status_code") == 0 or sub_data.get("code") == 0:
+                        logging.info(f"[SUB] Valid response from {sub_host} (may be empty)")
+                        break
+                except Exception as e:
+                    logging.warning(f"[SUB] Failed {sub_host}: {e}")
+                    continue
 
             plan_type, sub_info = classify_capcut_plan(sub_data)
 
