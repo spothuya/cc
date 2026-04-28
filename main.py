@@ -15,6 +15,7 @@ import traceback
 import tempfile
 import ssl as _ssl
 import urllib3
+from urllib.parse import quote, urlsplit, urlunsplit
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -144,6 +145,15 @@ proxy_lock = threading.Lock()
 pending_proxy_action = {}
 
 PROXY_TYPES = ["HTTP", "HTTPS", "SOCKS4", "SOCKS5"]
+HTTP_ONLY_PROXY_HOSTS = (
+    "geonode.io",
+    "proxy.geonode.io",
+    "smartproxy",
+    "brightdata",
+    "oxylabs",
+    "iproyal",
+    "packetstream",
+)
 
 def load_proxies():
     global proxy_list
@@ -161,62 +171,140 @@ def save_proxies():
     except Exception as e:
         logging.error(f"Failed to save proxies: {e}")
 
-def get_proxy_url(proxy_entry):
-    ptype = proxy_entry.get("type", "HTTP").upper()
-    raw = proxy_entry.get("proxy", "").strip()
+def _clean_proxy_type(ptype):
+    ptype = str(ptype or "HTTP").upper().strip()
+    return ptype if ptype in PROXY_TYPES else "HTTP"
+
+
+def _should_force_http(host):
+    host = str(host or "").lower()
+    return any(provider in host for provider in HTTP_ONLY_PROXY_HOSTS)
+
+
+def _split_proxy_raw(raw):
+    """Accept host:port:user:pass, host:port, user:pass@host:port, or a full URL."""
+    raw = str(raw or "").strip()
     if not raw:
         return None
 
-    # If user already pasted a full URL, use as-is
     if "://" in raw:
-        return raw
+        parsed = urlsplit(raw)
+        if not parsed.hostname or not parsed.port:
+            return None
+        return {
+            "scheme": parsed.scheme.lower(),
+            "host": parsed.hostname,
+            "port": str(parsed.port),
+            "user": parsed.username or "",
+            "pass": parsed.password or "",
+        }
 
-    parts = raw.split(":")
-    if len(parts) not in (2, 4):
+    if "@" in raw:
+        creds, host_port = raw.rsplit("@", 1)
+        hp = host_port.split(":", 1)
+        if len(hp) != 2:
+            return None
+        cp = creds.split(":", 1)
+        return {
+            "scheme": "",
+            "host": hp[0].strip(),
+            "port": hp[1].strip(),
+            "user": cp[0].strip() if cp else "",
+            "pass": cp[1].strip() if len(cp) == 2 else "",
+        }
+
+    parts = raw.split(":", 3)
+    if len(parts) == 2:
+        host, port = parts
+        return {"scheme": "", "host": host.strip(), "port": port.strip(), "user": "", "pass": ""}
+    if len(parts) == 4:
+        host, port, user, passwd = parts
+        return {
+            "scheme": "",
+            "host": host.strip(),
+            "port": port.strip(),
+            "user": user.strip(),
+            "pass": passwd.strip(),
+        }
+    return None
+
+
+def get_effective_proxy_type(proxy_entry):
+    ptype = _clean_proxy_type(proxy_entry.get("type", "HTTP"))
+    parsed = _split_proxy_raw(proxy_entry.get("proxy", ""))
+    if parsed and _should_force_http(parsed["host"]) and ptype in ("SOCKS4", "SOCKS5", "HTTPS"):
+        return "HTTP"
+    return ptype
+
+
+def format_proxy_display(proxy_entry):
+    parsed = _split_proxy_raw(proxy_entry.get("proxy", ""))
+    if parsed:
+        return f"{parsed['host']}:{parsed['port']}"
+    return str(proxy_entry.get("proxy", "?"))[:30]
+
+
+def get_proxy_url(proxy_entry):
+    parsed = _split_proxy_raw(proxy_entry.get("proxy", ""))
+    if not parsed:
         return None
 
-    host = parts[0].lower()
+    ptype = get_effective_proxy_type(proxy_entry)
+    host = parsed["host"]
+    port = parsed["port"]
+    user = parsed["user"]
+    passwd = parsed["pass"]
 
-    # Auto-correct: known HTTP-only residential providers must NOT use socks
-    HTTP_ONLY_HOSTS = ("geonode.io", "smartproxy", "brightdata", "oxylabs", "iproyal", "packetstream")
-    if any(h in host for h in HTTP_ONLY_HOSTS) and ptype in ("SOCKS4", "SOCKS5"):
-        ptype = "HTTP"
+    if not host or not port:
+        return None
 
-    if len(parts) == 4:
-        host_, port, user, passwd = parts
-        if ptype == "SOCKS4":
-            return f"socks4a://{user}:{passwd}@{host_}:{port}"
-        if ptype == "SOCKS5":
-            return f"socks5h://{user}:{passwd}@{host_}:{port}"
-        scheme = "https" if ptype == "HTTPS" else "http"
-        return f"{scheme}://{user}:{passwd}@{host_}:{port}"
+    if ptype == "SOCKS4":
+        scheme = "socks4a"
+    elif ptype == "SOCKS5":
+        scheme = "socks5h"
     else:
-        host_, port = parts
-        if ptype == "SOCKS4":
-            return f"socks4a://{host_}:{port}"
-        if ptype == "SOCKS5":
-            return f"socks5h://{host_}:{port}"
-        scheme = "https" if ptype == "HTTPS" else "http"
-        return f"{scheme}://{host_}:{port}"
+        # Most providers label these as HTTP/HTTPS proxies, but the proxy URL
+        # scheme for Python requests must still be http://. The https:// key
+        # below tells requests to CONNECT through this HTTP proxy for HTTPS sites.
+        scheme = "http"
+
+    netloc = f"{host}:{port}"
+    if user:
+        auth = quote(user, safe="")
+        if passwd:
+            auth += ":" + quote(passwd, safe="")
+        netloc = f"{auth}@{netloc}"
+
+    return urlunsplit((scheme, netloc, "", "", ""))
+
+
+def build_proxy_dict(proxy_entry):
+    proxy_url = get_proxy_url(proxy_entry)
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
 
 def get_random_proxy():
     with proxy_lock:
         if not proxy_list:
             return None
         entry = random.choice(proxy_list)
-        return get_proxy_url(entry), entry.get("type", "HTTP")
+        return get_proxy_url(entry), get_effective_proxy_type(entry)
 
 # ========== PROXY LIVE TESTER ==========
 PROXY_TEST_URL = "https://api.ipify.org?format=json"
 
 def test_one_proxy(entry, timeout=12):
-    proxy_url = get_proxy_url(entry)
-    if not proxy_url:
+    proxies = build_proxy_dict(entry)
+    if not proxies:
         return {"ok": False, "ip": "", "latency": 0, "error": "bad format"}
-    proxies = {"http": proxy_url, "https": proxy_url}
+
     t0 = time.time()
     try:
-        r = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=timeout)
+        session = requests.Session()
+        session.trust_env = False
+        session.proxies = proxies
+        r = session.get(PROXY_TEST_URL, timeout=timeout, verify=False)
         latency = int((time.time() - t0) * 1000)
         if r.status_code == 200:
             try:
@@ -227,7 +315,10 @@ def test_one_proxy(entry, timeout=12):
         return {"ok": False, "ip": "", "latency": latency, "error": f"HTTP {r.status_code}"}
     except Exception as e:
         latency = int((time.time() - t0) * 1000)
-        return {"ok": False, "ip": "", "latency": latency, "error": str(e)[:60]}
+        err = str(e)
+        if "BadStatusLine" in err or "\\x01\\x01" in err:
+            err = "proxy protocol mismatch / wrong proxy port"
+        return {"ok": False, "ip": "", "latency": latency, "error": err[:80]}
 
 
 class _TLSAdapter(HTTPAdapter):
@@ -256,6 +347,7 @@ class _TLSAdapter(HTTPAdapter):
 
 def create_session():
     session = requests.Session()
+    session.trust_env = False
     retry_strategy = Retry(
         total=MAX_RETRIES,
         backoff_factor=0.5,
@@ -812,9 +904,7 @@ def send_proxy_list(chat_id, page=0, message_id=None):
     with proxy_lock:
         for i, p in enumerate(proxy_list[start:end], start=start+1):
             ptype = p.get("type", "HTTP")
-            raw = p.get("proxy", "?")
-            parts = raw.split(":")
-            display = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else raw[:20]
+            display = format_proxy_display(p)
             icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
             text += f"{icon} `[{i}]` {ptype} ∙ `{display}`\n"
 
@@ -1037,9 +1127,7 @@ def callback_handler(call):
                 markup = InlineKeyboardMarkup(row_width=1)
                 for i, p in enumerate(proxy_list[:20]):
                     ptype = p.get("type", "HTTP")
-                    raw = p.get("proxy", "?")
-                    parts = raw.split(":")
-                    display = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else raw[:20]
+                    display = format_proxy_display(p)
                     icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
                     markup.add(InlineKeyboardButton(f"❌ {icon} {ptype} {display}", callback_data=f"proxy_del_{i}"))
                 markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
@@ -1121,10 +1209,8 @@ def callback_handler(call):
                     if not item:
                         continue
                     p, r = item
-                    ptype = p.get("type", "HTTP")
-                    raw = p.get("proxy", "?")
-                    parts = raw.split(":")
-                    display = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else raw[:20]
+                    ptype = get_effective_proxy_type(p)
+                    display = format_proxy_display(p)
                     icon_p = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
                     head = f"{icon_p} `[{i}]` {ptype} `{display}`"
                     if r["ok"]:
@@ -1564,10 +1650,10 @@ def proxy_text_input(message):
     added = 0
     errors = 0
     for line in lines:
-        parts = line.split(":")
-        if len(parts) >= 2:
+        preview_entry = {"proxy": line, "type": ptype}
+        if get_proxy_url(preview_entry):
             with proxy_lock:
-                proxy_list.append({"proxy": line, "type": ptype})
+                proxy_list.append({"proxy": line, "type": get_effective_proxy_type(preview_entry)})
             added += 1
         else:
             errors += 1
