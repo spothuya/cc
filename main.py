@@ -230,11 +230,10 @@ def _split_proxy_raw(raw):
 
 
 def get_effective_proxy_type(proxy_entry):
-    ptype = _clean_proxy_type(proxy_entry.get("type", "HTTP"))
-    parsed = _split_proxy_raw(proxy_entry.get("proxy", ""))
-    if parsed and _should_force_http(parsed["host"]) and ptype in ("SOCKS4", "SOCKS5", "HTTPS"):
-        return "HTTP"
-    return ptype
+    detected = _clean_proxy_type(proxy_entry.get("detected_type", "")) if proxy_entry.get("detected_type") else ""
+    if detected:
+        return detected
+    return _clean_proxy_type(proxy_entry.get("type", "HTTP"))
 
 
 def format_proxy_display(proxy_entry):
@@ -244,12 +243,12 @@ def format_proxy_display(proxy_entry):
     return str(proxy_entry.get("proxy", "?"))[:30]
 
 
-def get_proxy_url(proxy_entry):
+def get_proxy_url(proxy_entry, override_type=None):
     parsed = _split_proxy_raw(proxy_entry.get("proxy", ""))
     if not parsed:
         return None
 
-    ptype = get_effective_proxy_type(proxy_entry)
+    ptype = _clean_proxy_type(override_type) if override_type else get_effective_proxy_type(proxy_entry)
     host = parsed["host"]
     port = parsed["port"]
     user = parsed["user"]
@@ -262,10 +261,9 @@ def get_proxy_url(proxy_entry):
         scheme = "socks4a"
     elif ptype == "SOCKS5":
         scheme = "socks5h"
+    elif ptype == "HTTPS":
+        scheme = "https"
     else:
-        # Most providers label these as HTTP/HTTPS proxies, but the proxy URL
-        # scheme for Python requests must still be http://. The https:// key
-        # below tells requests to CONNECT through this HTTP proxy for HTTPS sites.
         scheme = "http"
 
     netloc = f"{host}:{port}"
@@ -278,11 +276,20 @@ def get_proxy_url(proxy_entry):
     return urlunsplit((scheme, netloc, "", "", ""))
 
 
-def build_proxy_dict(proxy_entry):
-    proxy_url = get_proxy_url(proxy_entry)
+def build_proxy_dict(proxy_entry, override_type=None):
+    proxy_url = get_proxy_url(proxy_entry, override_type=override_type)
     if not proxy_url:
         return None
     return {"http": proxy_url, "https": proxy_url}
+
+
+def proxy_type_candidates(proxy_entry):
+    selected = get_effective_proxy_type(proxy_entry)
+    candidates = [selected]
+    for t in ("HTTP", "SOCKS5", "SOCKS4", "HTTPS"):
+        if t not in candidates:
+            candidates.append(t)
+    return candidates
 
 def get_random_proxy():
     with proxy_lock:
@@ -295,30 +302,46 @@ def get_random_proxy():
 PROXY_TEST_URL = "https://api.ipify.org?format=json"
 
 def test_one_proxy(entry, timeout=12):
-    proxies = build_proxy_dict(entry)
-    if not proxies:
-        return {"ok": False, "ip": "", "latency": 0, "error": "bad format"}
+    if not _split_proxy_raw(entry.get("proxy", "")):
+        return {"ok": False, "ip": "", "latency": 0, "error": "bad format", "type": get_effective_proxy_type(entry)}
 
-    t0 = time.time()
-    try:
-        session = requests.Session()
-        session.trust_env = False
-        session.proxies = proxies
-        r = session.get(PROXY_TEST_URL, timeout=timeout, verify=False)
-        latency = int((time.time() - t0) * 1000)
-        if r.status_code == 200:
-            try:
-                ip = r.json().get("ip", "?")
-            except Exception:
-                ip = r.text.strip()[:40]
-            return {"ok": True, "ip": ip, "latency": latency, "error": ""}
-        return {"ok": False, "ip": "", "latency": latency, "error": f"HTTP {r.status_code}"}
-    except Exception as e:
-        latency = int((time.time() - t0) * 1000)
-        err = str(e)
-        if "BadStatusLine" in err or "\\x01\\x01" in err:
-            err = "proxy protocol mismatch / wrong proxy port"
-        return {"ok": False, "ip": "", "latency": latency, "error": err[:80]}
+    first_error = ""
+    total_start = time.time()
+    for candidate_type in proxy_type_candidates(entry):
+        proxies = build_proxy_dict(entry, override_type=candidate_type)
+        if not proxies:
+            continue
+        t0 = time.time()
+        try:
+            session = requests.Session()
+            session.trust_env = False
+            session.proxies = proxies
+            r = session.get(PROXY_TEST_URL, timeout=timeout, verify=False)
+            latency = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                try:
+                    ip = r.json().get("ip", "?")
+                except Exception:
+                    ip = r.text.strip()[:40]
+                return {"ok": True, "ip": ip, "latency": latency, "error": "", "type": candidate_type}
+            err = f"{candidate_type} HTTP {r.status_code}"
+        except Exception as e:
+            err = str(e)
+            if "BadStatusLine" in err or "\x01\x01" in err:
+                err = f"{candidate_type} protocol mismatch"
+            else:
+                err = f"{candidate_type} {err[:65]}"
+        if not first_error:
+            first_error = err
+
+    latency = int((time.time() - total_start) * 1000)
+    return {
+        "ok": False,
+        "ip": "",
+        "latency": latency,
+        "error": (first_error or "all proxy protocols failed")[:90],
+        "type": get_effective_proxy_type(entry),
+    }
 
 
 class _TLSAdapter(HTTPAdapter):
