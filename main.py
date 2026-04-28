@@ -919,9 +919,10 @@ def callback_handler(call):
                         for e, p, r in all_team_hits:
                             txt += f"{r}\n{'-'*30}\n"
                     total = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
-                file_obj = io.BytesIO(txt.encode('utf-8'))
-                file_obj.name = f"capcut_hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, file_obj, caption=f"📋 Total Hits: {total}")
+                fname = f"capcut_hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                bot.send_document(call.message.chat.id, txt.encode('utf-8'),
+                                  visible_file_name=fname,
+                                  caption=f"📋 Total Hits: {total}")
 
         elif call.data == "export_free":
             bot.answer_callback_query(call.id)
@@ -933,9 +934,9 @@ def callback_handler(call):
                 txt = f"FREE ACCOUNTS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n" + "="*30 + "\n\n"
                 for e, p in free_snap:
                     txt += f"{e}:{p}\n"
-                file_obj = io.BytesIO(txt.encode("utf-8"))
-                file_obj.name = f"capcut_free_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, file_obj,
+                fname = f"capcut_free_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                bot.send_document(call.message.chat.id, txt.encode("utf-8"),
+                                  visible_file_name=fname,
                                   caption=f"⚠️ Free Accounts: {len(free_snap)}")
 
         elif call.data == "export_errors":
@@ -949,9 +950,9 @@ def callback_handler(call):
                 txt += f"Total: {len(error_snap)} accounts\n\n"
                 for e, p in error_snap:
                     txt += f"{e}:{p}\n"
-                file_obj = io.BytesIO(txt.encode("utf-8"))
-                file_obj.name = f"capcut_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, file_obj,
+                fname = f"capcut_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                bot.send_document(call.message.chat.id, txt.encode("utf-8"),
+                                  visible_file_name=fname,
                                   caption=f"❌ Error Accounts: {len(error_snap)}")
 
         elif call.data.startswith("hits_page_"):
@@ -1342,12 +1343,14 @@ def process_combos(chat_id, combos):
                 e, p, detail = item
                 lines.append(detail)
                 lines.append("=" * 40)
-        fobj = io.BytesIO("\n".join(lines).encode("utf-8"))
-        fobj.name = fname
+        data_bytes = "\n".join(lines).encode("utf-8")
         try:
-            bot.send_document(cid, fobj, caption=caption)
-        except Exception:
-            pass
+            bot.send_document(cid, data_bytes, visible_file_name=fname, caption=caption)
+        except Exception as _e:
+            try:
+                bot.send_message(cid, f"⚠️ Failed to send {fname}: {_e}")
+            except Exception:
+                pass
 
     with hits_lock:
         _snap_pro = list(all_pro_hits)
