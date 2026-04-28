@@ -12,6 +12,7 @@ import os
 import io
 import random
 import traceback
+import tempfile
 import ssl as _ssl
 import urllib3
 from datetime import datetime, timezone
@@ -52,6 +53,34 @@ all_standard_hits = []
 all_team_hits = []
 all_free_accounts = []
 all_error_accounts = []
+
+
+def get_display_user(message_or_user):
+    user = getattr(message_or_user, "from_user", message_or_user)
+    uid = getattr(user, "id", None)
+    username = getattr(user, "username", None)
+    name = getattr(user, "first_name", None) or getattr(user, "last_name", None) or "User"
+    if username:
+        return f"@{username} | ID: {uid}"
+    return f"{name} | ID: {uid}"
+
+
+def send_text_document(chat_id, text, filename, caption=None):
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename) or "result.txt"
+    temp_dir = tempfile.mkdtemp(prefix="tgdoc_")
+    temp_path = os.path.join(temp_dir, safe_name)
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        with open(temp_path, "rb") as doc:
+            bot.send_document(chat_id, doc, caption=caption)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            os.rmdir(temp_dir)
+        except Exception:
+            pass
 
 # Aggregate counters
 pro_count = 0
@@ -555,7 +584,7 @@ def check_single_account(email, password):
 
 
 # ========== MENU ==========
-def send_main_menu(chat_id, user_id=None):
+def send_main_menu(chat_id, user_id=None, user_label=None):
     with hits_lock:
         total_hits = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
     active_count = sum(1 for s in user_sessions.values() if s.get("checking_active"))
@@ -565,7 +594,7 @@ def send_main_menu(chat_id, user_id=None):
     msg = f"""{'━' * 32}
 ✂️ 𝗧𝗵𝘂𝘆𝗮 𝗖𝗮𝗽𝗖𝘂𝘁 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 𝗩𝟭
 {'━' * 32}
-👑 @Thuya ∙ {status}
+👑 {user_label or f"ID: {user_id or chat_id}"} ∙ {status}
 🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x retry
 👥 Active checkers: {active_count}
 
@@ -920,9 +949,7 @@ def callback_handler(call):
                             txt += f"{r}\n{'-'*30}\n"
                     total = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
                 fname = f"capcut_hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, txt.encode('utf-8'),
-                                  visible_file_name=fname,
-                                  caption=f"📋 Total Hits: {total}")
+                send_text_document(call.message.chat.id, txt, fname, f"📋 Total Hits: {total}")
 
         elif call.data == "export_free":
             bot.answer_callback_query(call.id)
@@ -935,9 +962,7 @@ def callback_handler(call):
                 for e, p in free_snap:
                     txt += f"{e}:{p}\n"
                 fname = f"capcut_free_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, txt.encode("utf-8"),
-                                  visible_file_name=fname,
-                                  caption=f"⚠️ Free Accounts: {len(free_snap)}")
+                send_text_document(call.message.chat.id, txt, fname, f"⚠️ Free Accounts: {len(free_snap)}")
 
         elif call.data == "export_errors":
             bot.answer_callback_query(call.id)
@@ -951,9 +976,7 @@ def callback_handler(call):
                 for e, p in error_snap:
                     txt += f"{e}:{p}\n"
                 fname = f"capcut_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, txt.encode("utf-8"),
-                                  visible_file_name=fname,
-                                  caption=f"❌ Error Accounts: {len(error_snap)}")
+                send_text_document(call.message.chat.id, txt, fname, f"❌ Error Accounts: {len(error_snap)}")
 
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
@@ -1343,9 +1366,9 @@ def process_combos(chat_id, combos):
                 e, p, detail = item
                 lines.append(detail)
                 lines.append("=" * 40)
-        data_bytes = "\n".join(lines).encode("utf-8")
+        txt = "\n".join(lines)
         try:
-            bot.send_document(cid, data_bytes, visible_file_name=fname, caption=caption)
+            send_text_document(cid, txt, fname, caption)
         except Exception as _e:
             try:
                 bot.send_message(cid, f"⚠️ Failed to send {fname}: {_e}")
@@ -1383,7 +1406,7 @@ def start_command(message):
             f"⛔ Unauthorized.\n\nYour ID: `{message.from_user.id}`\nAsk an admin to add you.",
             parse_mode='Markdown')
         return
-    send_main_menu(message.chat.id, message.from_user.id)
+    send_main_menu(message.chat.id, message.from_user.id, get_display_user(message))
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
