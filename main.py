@@ -163,25 +163,41 @@ def save_proxies():
 
 def get_proxy_url(proxy_entry):
     ptype = proxy_entry.get("type", "HTTP").upper()
-    raw = proxy_entry.get("proxy", "")
+    raw = proxy_entry.get("proxy", "").strip()
+    if not raw:
+        return None
+
+    # If user already pasted a full URL, use as-is
+    if "://" in raw:
+        return raw
+
     parts = raw.split(":")
+    if len(parts) not in (2, 4):
+        return None
+
+    host = parts[0].lower()
+
+    # Auto-correct: known HTTP-only residential providers must NOT use socks
+    HTTP_ONLY_HOSTS = ("geonode.io", "smartproxy", "brightdata", "oxylabs", "iproyal", "packetstream")
+    if any(h in host for h in HTTP_ONLY_HOSTS) and ptype in ("SOCKS4", "SOCKS5"):
+        ptype = "HTTP"
+
     if len(parts) == 4:
-        host, port, user, passwd = parts
-        if ptype in ("SOCKS4", "SOCKS5"):
-            scheme = "socks4a" if ptype == "SOCKS4" else "socks5h"
-            return f"{scheme}://{user}:{passwd}@{host}:{port}"
-        else:
-            scheme = "https" if ptype == "HTTPS" else "http"
-            return f"{scheme}://{user}:{passwd}@{host}:{port}"
-    elif len(parts) == 2:
-        host, port = parts
-        if ptype in ("SOCKS4", "SOCKS5"):
-            scheme = "socks4a" if ptype == "SOCKS4" else "socks5h"
-            return f"{scheme}://{host}:{port}"
-        else:
-            scheme = "https" if ptype == "HTTPS" else "http"
-            return f"{scheme}://{host}:{port}"
-    return None
+        host_, port, user, passwd = parts
+        if ptype == "SOCKS4":
+            return f"socks4a://{user}:{passwd}@{host_}:{port}"
+        if ptype == "SOCKS5":
+            return f"socks5h://{user}:{passwd}@{host_}:{port}"
+        scheme = "https" if ptype == "HTTPS" else "http"
+        return f"{scheme}://{user}:{passwd}@{host_}:{port}"
+    else:
+        host_, port = parts
+        if ptype == "SOCKS4":
+            return f"socks4a://{host_}:{port}"
+        if ptype == "SOCKS5":
+            return f"socks5h://{host_}:{port}"
+        scheme = "https" if ptype == "HTTPS" else "http"
+        return f"{scheme}://{host_}:{port}"
 
 def get_random_proxy():
     with proxy_lock:
